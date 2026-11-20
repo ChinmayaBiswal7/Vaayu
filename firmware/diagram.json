@@ -1,0 +1,179 @@
+{
+  "version": 1,
+  "author": "Vaayu Hub",
+  "editor": "wokwi",
+  "parts": [
+    {
+      "type": "board-esp32s3-devkitc-1",
+      "id": "esp32",
+      "top": 0,
+      "left": 0,
+      "attrs": {}
+    },
+    {
+      "type": "wokwi-ssd1306",
+      "id": "oled",
+      "top": -120,
+      "left": -180,
+      "attrs": {
+        "address": "0x3C"
+      }
+    },
+    {
+      "type": "wokwi-sht31",
+      "id": "sht31",
+      "top": -120,
+      "left": 60,
+      "attrs": {
+        "address": "0x44"
+      }
+    },
+    {
+      "type": "wokwi-ds18b20",
+      "id": "ds18b20",
+      "top": 60,
+      "left": -240,
+      "attrs": {
+        "temperature": "25"
+      }
+    },
+    {
+      "type": "wokwi-resistor",
+      "id": "r_ds18",
+      "top": 20,
+      "left": -180,
+      "attrs": {
+        "resistance": "4700",
+        "label": "4.7kΩ pull-up"
+      }
+    },
+    {
+      "type": "wokwi-pushbutton",
+      "id": "btn_presence",
+      "top": 160,
+      "left": -240,
+      "attrs": {
+        "color": "green",
+        "label": "Presence (GPIO0)"
+      }
+    },
+    {
+      "type": "wokwi-resistor",
+      "id": "r_btn0",
+      "top": 160,
+      "left": -150,
+      "attrs": {
+        "resistance": "10000",
+        "label": "10kΩ pull-up"
+      }
+    },
+    {
+      "type": "wokwi-pushbutton",
+      "id": "btn_ir",
+      "top": 160,
+      "left": -60,
+      "attrs": {
+        "color": "blue",
+        "label": "IR Override (GPIO1)"
+      }
+    },
+    {
+      "type": "wokwi-resistor",
+      "id": "r_btn1",
+      "top": 160,
+      "left": 30,
+      "attrs": {
+        "resistance": "10000",
+        "label": "10kΩ pull-up"
+      }
+    },
+    {
+      "type": "wokwi-led",
+      "id": "led_fan",
+      "top": 260,
+      "left": -240,
+      "attrs": {
+        "color": "yellow",
+        "label": "Fan PWM (GPIO2)"
+      }
+    },
+    {
+      "type": "wokwi-resistor",
+      "id": "r_led_fan",
+      "top": 260,
+      "left": -150,
+      "attrs": {
+        "resistance": "220",
+        "label": "220Ω"
+      }
+    },
+    {
+      "type": "wokwi-led",
+      "id": "led_exhaust",
+      "top": 260,
+      "left": -60,
+      "attrs": {
+        "color": "red",
+        "label": "Exhaust Fan (GPIO3)"
+      }
+    },
+    {
+      "type": "wokwi-resistor",
+      "id": "r_led_exhaust",
+      "top": 260,
+      "left": 30,
+      "attrs": {
+        "resistance": "220",
+        "label": "220Ω"
+      }
+    },
+    {
+      "type": "wokwi-buzzer",
+      "id": "buzzer",
+      "top": 260,
+      "left": 120,
+      "attrs": {
+        "volume": "0.5"
+      }
+    }
+  ],
+  "connections": [
+    ["esp32:3V3",   "oled:VCC",    "red",   []],
+    ["esp32:GND",   "oled:GND",    "black", []],
+    ["esp32:8",     "oled:SDA",    "blue",  []],
+    ["esp32:9",     "oled:SCL",    "green", []],
+
+    ["esp32:3V3",   "sht31:VCC",   "red",   []],
+    ["esp32:GND",   "sht31:GND",   "black", []],
+    ["esp32:8",     "sht31:SDA",   "blue",  []],
+    ["esp32:9",     "sht31:SCL",   "green", []],
+
+    ["esp32:3V3",   "r_ds18:1",    "red",   []],
+    ["r_ds18:2",    "ds18b20:DQ",  "orange",[]],
+    ["esp32:10",    "ds18b20:DQ",  "orange",[]],
+    ["esp32:GND",   "ds18b20:GND", "black", []],
+    ["esp32:3V3",   "ds18b20:VCC", "red",   []],
+
+    ["esp32:3V3",   "r_btn0:1",    "red",   []],
+    ["r_btn0:2",    "btn_presence:1.l","yellow",[]],
+    ["esp32:0",     "btn_presence:1.l","yellow",[]],
+    ["esp32:GND",   "btn_presence:2.l","black", []],
+
+    ["esp32:3V3",   "r_btn1:1",    "red",   []],
+    ["r_btn1:2",    "btn_ir:1.l",  "yellow",[]],
+    ["esp32:1",     "btn_ir:1.l",  "yellow",[]],
+    ["esp32:GND",   "btn_ir:2.l",  "black", []],
+
+    ["esp32:2",     "r_led_fan:1", "yellow",[]],
+    ["r_led_fan:2", "led_fan:A",   "yellow",[]],
+    ["esp32:GND",   "led_fan:C",   "black", []],
+
+    ["esp32:3",     "r_led_exhaust:1","orange",[]],
+    ["r_led_exhaust:2","led_exhaust:A","orange",[]],
+    ["esp32:GND",   "led_exhaust:C", "black",[]],
+
+    ["esp32:6",     "buzzer:1",    "purple",[]],
+    ["esp32:GND",   "buzzer:2",    "black", []]
+  ],
+  "dependencies": {}
+}
