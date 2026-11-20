@@ -1,133 +1,152 @@
 #pragma once
 // ============================================================
-//  config.h — All tuneable constants for Vaayu Hub
-//  Edit this file to adjust behaviour without touching logic.
+//  config.h — All tuneable constants & pinouts for Vaayu Hub
+//  Strictly conforms to VAAYU_CONTEXT.md (AtomQuest 2026 - Round 3)
 // ============================================================
 
 // ── Pin assignments (ESP32 DevKit V1 / WROOM-32) ─────────────
+// Section 5 of VAAYU_CONTEXT.md
 
-// I2C (shared bus: 0.96" SSD1306 OLED + AHT20 sensor)
+// OLED + AHT20 (shared I2C bus at 3.3V)
 #define PIN_I2C_SDA        21   // Standard ESP32 I2C SDA
 #define PIN_I2C_SCL        22   // Standard ESP32 I2C SCL
 #define AHT20_ADDR         0x38 // Default AHT20 I2C address
-#define OLED_ADDR          0x3C // Default SSD1306 I2C address
+#define OLED_ADDR          0x3C // Default SSD1306 0.96" OLED address
+#define OLED_WIDTH         128
+#define OLED_HEIGHT        64
+
+// Bathroom DHT11 (wired to hub on a 2–3 m wire)
+#define PIN_DHT11          4    // 10 kΩ pull-up to 3.3V
+
+// DS18B20 (taped at AC air outlet) — 1-Wire
+#define PIN_DS18B20        27   // 4.7 kΩ pull-up to 3.3V
 
 // HLK-LD2410C mmWave radar — UART2 (Serial2)
 #define PIN_RADAR_RX       16   // ESP32 RX2 (GPIO16) ← radar TX
 #define PIN_RADAR_TX       17   // ESP32 TX2 (GPIO17) → radar RX
 #define RADAR_BAUD         256000
 
-// DS18B20 (AC outlet temp probe) — 1-Wire (with 4.7 kΩ pull-up to 3.3V)
-#define PIN_DS18B20        4
+// 940 nm IR transmitter LED (via BC547 NPN transistor)
+#define PIN_IR_SEND        25   // GPIO 25 → 1 kΩ → BC547 base
 
-// PWM — L9110S Motor Driver: 5V Room Fan (Channel A)
-#define PIN_FAN_IA         25   // L9110S A-IA (PWM speed control)
-#define PIN_FAN_IB         26   // L9110S A-IB (direction / LOW)
+// VS1838B IR receiver (38 kHz)
+#define PIN_IR_RECV        26   // 3.3V supply
+
+// Main room fan — L9110S dual motor driver (A-IA PWM, A-IB tied to GND)
+#define PIN_FAN_PWM        32   // L9110S A-IA (PWM speed)
 #define FAN_PWM_CHANNEL    0
-#define FAN_PWM_FREQ       5000 // 5 kHz PWM for 5V DC fan
+#define FAN_PWM_FREQ       22000 // 22 kHz — inaudible PWM
 #define FAN_PWM_BITS       8    // 0-255 duty
 
-// PWM — L9110S Motor Driver: 5V Exhaust Fan (Channel B)
-#define PIN_EXHAUST_IA     27   // L9110S B-IA (PWM speed control / ON-OFF)
-#define PIN_EXHAUST_IB     14   // L9110S B-IB (direction / LOW)
+// Exhaust fan — L9110S dual motor driver (B-IA PWM, B-IB tied to GND)
+#define PIN_EXHAUST_PWM    14   // L9110S B-IA (PWM speed)
 #define EXHAUST_PWM_CH     1
-#define EXHAUST_PWM_FREQ   5000
+#define EXHAUST_PWM_FREQ   22000
 #define EXHAUST_PWM_BITS   8
 
-// 940 nm IR transmitter LED (via BC547 NPN transistor)
-#define PIN_IR_SEND        18
+// Buzzer (audible fail-safe alarm)
+#define PIN_BUZZER         19
+#define BUZZER_FREQ_HZ     2000
 
-// VS1838B IR receiver module
-#define PIN_IR_RECV        19
+// Optional PIR backup (if radar is unavailable)
+#define PIN_PIR_BACKUP     34   // Input-only pin
 
-// Buzzer (active 5V buzzer)
-#define PIN_BUZZER         23
+// ── Fan Level & Airspeed Definitions ─────────────────────────
+// Section 6 & 7: 6 discrete fan levels (0 to 5)
+#define FAN_LEVELS_COUNT   6
 
-// ── Temperature thresholds ───────────────────────────────────
+// Air velocity estimates at ~1.5 m (m/s) for levels 0–5
+static const float FAN_VELOCITIES[FAN_LEVELS_COUNT] = { 0.0f, 0.30f, 0.55f, 0.80f, 1.05f, 1.35f };
 
-// Below this → fan stays off (comfortable)
-#define TEMP_FAN_ON        24.0f   // °C
+// PWM Duty cycle values (0–255) for levels 0–5: 0%, 35%, 50%, 65%, 80%, 100%
+static const uint8_t FAN_DUTIES[FAN_LEVELS_COUNT]   = { 0, 89, 128, 166, 204, 255 };
 
-// Fan speed is proportional between TEMP_FAN_ON and TEMP_FAN_MAX
-#define TEMP_FAN_MAX       30.0f   // °C → 100% fan speed
+// ── Comfort Index & Profiles ─────────────────────────────────
+// Formula: CI = T + 0.05 * (RH - 50.0) - credit(v)
+// credit(v) = 2.5 * min(v / 0.8, 1.2)
+enum ComfortProfile {
+    PROFILE_NORMAL = 0, // Default: Target 25.5°C, Max fan 5, AC 26–28°C, Monsoon OFF
+    PROFILE_SLEEP  = 1, // Sleep:   Target 25.5°C, Max fan 3, AC 26–28°C, Monsoon OFF
+    PROFILE_HUMID  = 2, // Humid:   Target 25.5°C, Max fan 5, AC 26–28°C, Monsoon ON
+    PROFILE_ECO    = 3  // Eco:     Target 26.0°C, Max fan 5, AC 26–29°C, Monsoon OFF
+};
 
-// If temp still ≥ this after DELAY_AC_ON_MS at full fan → turn AC on
-#define TEMP_AC_ON         26.0f   // °C
+struct ProfileConfig {
+    float   targetCI;
+    uint8_t maxFanLevel;
+    int     acStartTemp;
+    int     acCapTemp;
+    bool    monsoonMode;
+};
 
-// While AC is on and temp drops to this → start setpoint creep
-#define TEMP_AC_CREEP      25.0f   // °C
+static const ProfileConfig PROFILES[4] = {
+    { 25.5f, 5, 26, 28, false }, // PROFILE_NORMAL
+    { 25.5f, 3, 26, 28, false }, // PROFILE_SLEEP
+    { 25.5f, 5, 26, 28, true  }, // PROFILE_HUMID
+    { 26.0f, 5, 26, 29, false }  // PROFILE_ECO
+};
 
-// AC setpoint limits
-#define AC_SETPOINT_MIN    18      // °C (absolute minimum)
-#define AC_SETPOINT_DEFAULT 24     // °C (starting setpoint)
-#define AC_SETPOINT_MAX    28      // °C (ceiling during creep)
+// ── Control Timings & Thresholds ─────────────────────────────
+// Normal: 1 control tick = 1 minute (60,000 ms).
+// Fast-test mode: 1 control tick = 5 seconds (5,000 ms).
+#define NORMAL_TICK_MS         60000UL
+#define FAST_TEST_TICK_MS       5000UL
 
-// ── Humidity thresholds ──────────────────────────────────────
+// Occupancy counters (in minutes)
+#define OCCUPANCY_EMPTY_LOG_MIN     3   // "room confirmed empty"
+#define OCCUPANCY_FAN_OFF_MIN       5   // save fan level, fan off
+#define OCCUPANCY_AC_OFF_MIN       10   // save AC state, AC off
 
-// Bathroom humidity above this → exhaust fan ON
-#define HUMIDITY_EXHAUST_ON   70.0f  // %RH
+// AC Compressor & Command Rules
+#define AC_COMMAND_RATE_LIMIT_MIN  10   // at most one command every 10 min
+#define AC_RESTART_LOCKOUT_MIN      3   // at least 3 min between OFF and ON
+#define AC_FULL_FAN_TRIGGER_MIN    10   // 10 min at full fan & CI > target+0.5 -> AC ON
+#define AC_SETPOINT_CREEP_MIN      15   // 15 min at CI <= target+0.5 -> setpoint +1°C
+#define AC_GIVE_BACK_MIN           10   // 10 min at full fan & CI > target+1.0 -> setpoint -1°C
 
-// Exhaust fan stays ON until humidity has been below this for DELAY_EXHAUST_OFF_MS
-#define HUMIDITY_EXHAUST_OFF  60.0f  // %RH
+// DS18B20 AC Confirmation Check (The Failsafe)
+#define AC_CONFIRM_WAIT_MIN         3   // wait 3 min after ON/OFF before reading DS18B20
+#define AC_CONFIRM_COOL_DROP        3.0f // outlet <= roomTemp - 3.0°C
+#define AC_CONFIRM_DRY_DROP         2.0f // outlet <= roomTemp - 2.0°C in Dry mode
+#define AC_CONFIRM_OFF_DELTA        2.0f // outlet within 2.0°C of room temp
 
-// Monsoon mode: if room humidity > this → send AC "Dry" mode
-#define HUMIDITY_MONSOON      75.0f  // %RH
+// Bathroom Exhaust Humidity Rules (DHT11)
+#define EXHAUST_EMA_ALPHA           0.033f // 30-min time constant EMA (1/30)
+#define EXHAUST_TRIGGER_SPIKE       8.0f   // RH rises >= 8% above baseline
+#define EXHAUST_TRIGGER_HIGH_RH     75.0f  // RH > 75% while >= 3% above baseline
+#define EXHAUST_TRIGGER_HIGH_DELTA  3.0f
+#define EXHAUST_OFF_DELTA           3.0f   // within 3% of baseline
+#define EXHAUST_OFF_STABLE_MIN      2      // for 2 consecutive minutes
+#define EXHAUST_MAX_RUNTIME_MIN    45      // hard limit: shut off after 45 min
+#define EXHAUST_SENSOR_TIMEOUT_MIN 10      // if sensor dead for 10 min -> manual mode
 
-// ── Timing constants (all in milliseconds) ───────────────────
+// Manual Override
+#define MANUAL_OVERRIDE_PAUSE_MIN  30      // pause automation for 30 minutes
+#define MANUAL_OVERRIDE_SHIFT_CI    0.15f  // shift comfort target by 0.15°C
 
-// How long at full fan speed before we consider turning AC on
-#define DELAY_AC_ON_MS         (10UL * 60 * 1000)   // 10 min
+// Sensor Outlier & Range Validation
+#define TEMP_VALID_MIN             -10.0f
+#define TEMP_VALID_MAX              60.0f
+#define HUMIDITY_VALID_MIN           0.0f
+#define HUMIDITY_VALID_MAX         100.0f
+#define TEMP_OUTLIER_DELTA           5.0f  // max jump per cycle
+#define HUMIDITY_OUTLIER_DELTA      20.0f  // max jump per cycle
+#define SENSOR_STUCK_TIMEOUT_MIN    10     // exact same value for > 10 min -> fault
 
-// How often setpoint creeps up 1°C while comfortable
-#define DELAY_AC_CREEP_MS      (15UL * 60 * 1000)   // 15 min
+// ── Networking & Wi-Fi Access Point ──────────────────────────
+// Section 7: Standalone SoftAP (no external router needed)
+#define SOFTAP_SSID        "Vaayu-Hub"
+#define SOFTAP_PASSWORD    "vaayuhub123"
+#define HTTP_PORT          80
 
-// No presence → fan off after this
-#define DELAY_EMPTY_FAN_OFF_MS  (5UL * 60 * 1000)   // 5 min
+// Optional Station Mode / MQTT
+#define WIFI_STA_SSID      "YourSSID"
+#define WIFI_STA_PASSWORD  "YourPassword"
+#define MQTT_BROKER        "192.168.29.208"
+#define MQTT_PORT          1883
+#define MQTT_CLIENT_ID     "vaayu-hub"
 
-// No presence → AC off after this (from last presence event)
-#define DELAY_EMPTY_AC_OFF_MS  (10UL * 60 * 1000)   // 10 min
-
-// Exhaust fan stays ON for at least this after humidity drops
-#define DELAY_EXHAUST_OFF_MS    (2UL * 60 * 1000)   // 2 min
-
-// Sensor out-of-range → alarm after this
-#define DELAY_SENSOR_ALARM_MS  (30UL * 1000)         // 30 s
-
-// After human IR remote press → pause automation for this long
-#define DELAY_IR_OVERRIDE_MS   (30UL * 60 * 1000)   // 30 min
-
-// DS18B20 temperature settling after AC command before we check
-#define DELAY_AC_CONFIRM_MS    (3UL * 60 * 1000)    // 3 min
-
-// How much the DS18B20 must drop to confirm AC is running
-#define AC_CONFIRM_DROP        2.0f   // °C drop from ambient
-
-// ── Sensor validation ranges ─────────────────────────────────
-
-#define TEMP_VALID_MIN    -10.0f   // °C
-#define TEMP_VALID_MAX     60.0f   // °C
-#define HUMIDITY_VALID_MIN  0.0f   // %RH
-#define HUMIDITY_VALID_MAX 100.0f  // %RH
-
-// Outlier rejection: reject reading if delta from last good > this
-#define TEMP_OUTLIER_DELTA    5.0f   // °C per reading cycle
-#define HUMIDITY_OUTLIER_DELTA 20.0f // %RH per reading cycle
-
-// ── Radar / presence ─────────────────────────────────────────
-
-// Distance at which fan ramps to 100% (closest detected target)
-#define RADAR_DISTANCE_NEAR_CM   100   // cm → max fan speed
-#define RADAR_DISTANCE_FAR_CM    500   // cm → min fan speed (blended)
-
-// ── MQTT / Wi-Fi ─────────────────────────────────────────────
-
-#define WIFI_SSID       "YourSSID"          // ← change
-#define WIFI_PASSWORD   "YourPassword"       // ← change
-#define MQTT_BROKER     "192.168.29.208"     // User's laptop IP
-#define MQTT_PORT       1883
-#define MQTT_CLIENT_ID  "vaayu-hub"
-
-// Topics — published by hub
+// Topics
 #define TOPIC_ROOM_TEMP      "vaayu/room/temp"
 #define TOPIC_ROOM_HUMIDITY  "vaayu/room/humidity"
 #define TOPIC_ROOM_PRESENCE  "vaayu/room/presence"
@@ -138,31 +157,9 @@
 #define TOPIC_EXHAUST_STATE  "vaayu/exhaust/state"
 #define TOPIC_STATE_REASON   "vaayu/state/reason"
 #define TOPIC_ALARM          "vaayu/alarm"
-
-// Topics — published by bathroom node
 #define TOPIC_BATH_HUMIDITY  "vaayu/bathroom/humidity"
 #define TOPIC_BATH_TEMP      "vaayu/bathroom/temp"
 
-// Topics — commands from dashboard
-#define TOPIC_CMD_OVERRIDE   "vaayu/cmd/override"
-#define TOPIC_CMD_FAN_SPEED  "vaayu/cmd/fan_speed"
-#define TOPIC_CMD_AC_SETPOINT "vaayu/cmd/ac_setpoint"
-#define TOPIC_CMD_AC_STATE   "vaayu/cmd/ac_state"
-
-// ── FreeRTOS task periods ────────────────────────────────────
-
-#define TASK_SENSORS_MS   5000    // sensor read interval
-#define TASK_CONTROL_MS   10000   // control loop interval (10 s; counts internal timers)
-#define TASK_DISPLAY_MS   1000    // OLED refresh
-
-// ── Misc ─────────────────────────────────────────────────────
-
-#define BUZZER_FREQ_HZ   2000   // Hz for tone() equivalent
-#define OLED_ADDR        0x3C   // SSD1306 I2C address
-#define OLED_WIDTH       128
-#define OLED_HEIGHT       64
-
-// ── Simulation / Testing ─────────────────────────────────────
-// Uncomment to inject fake sensor data for Wokwi / PC testing
-// #define SIMULATE_SENSORS
-
+// FreeRTOS Task intervals
+#define TASK_SENSORS_MS    2000  // read AHT20 & DHT11 every 2s
+#define TASK_DISPLAY_MS     500  // OLED refresh every 500ms

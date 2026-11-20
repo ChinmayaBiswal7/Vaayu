@@ -1,13 +1,6 @@
 // ============================================================
 //  display.cpp — SSD1306 OLED renderer
-//
-//  Layout (128×64 px, font 6×8):
-//  Row 0 (y=0):  "Vaayu Hub"            [title]
-//  Row 1 (y=10): "T:25.3  H:62%"
-//  Row 2 (y=20): "Fan:72%  AC:26°C"
-//  Row 3 (y=30): "Exhaust:ON  PR:YES"
-//  Row 4 (y=40): "Bath H:68%"
-//  Row 5 (y=52): [scrolling reason string]
+//  Layout conforming to Section 6 & 7 of VAAYU_CONTEXT.md
 // ============================================================
 #include "display.h"
 #include "config.h"
@@ -18,113 +11,104 @@
 static Adafruit_SSD1306 oled(OLED_WIDTH, OLED_HEIGHT, &Wire, -1);
 
 // Scroll state for the reason string
-static int16_t  scrollX     = OLED_WIDTH;
+static int16_t  scrollX      = OLED_WIDTH;
 static uint32_t lastScrollMs = 0;
-static char     lastReason[80] = "";
+static char     lastReason[96] = "";
 
 void display_init() {
     if (!oled.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
-        Serial.println("[display] SSD1306 not found");
+        Serial.println("[display] SSD1306 not found at 0x3C");
         return;
     }
     oled.clearDisplay();
     oled.setTextColor(SSD1306_WHITE);
     oled.setTextWrap(false);
-    oled.setTextSize(1);  // 6×8 px per char
+    oled.setTextSize(1);
 
-    oled.setCursor(28, 24);
-    oled.print("Vaayu Hub");
+    oled.setCursor(20, 24);
+    oled.print("VAAYU HUB v3");
     oled.display();
-    delay(1500);
+    delay(1000);
     Serial.println("[display] OLED ready");
 }
 
 void display_update(const SensorData& sd, const ControlState& cs) {
     oled.clearDisplay();
 
-    // ── Title ────────────────────────────────────────────────
+    // ── Header / Title ───────────────────────────────────────
     oled.setTextSize(1);
-    oled.setCursor(28, 0);
-    oled.print("Vaayu Hub");
-
-    // ── Divider ──────────────────────────────────────────────
+    if (cs.fastTestMode) {
+        oled.setCursor(4, 0);
+        oled.print("* FAST TEST (5s) *");
+    } else {
+        oled.setCursor(18, 0);
+        const char* pNames[] = { "NORM", "SLEEP", "HUMID", "ECO" };
+        oled.printf("VAAYU HUB [%s]", pNames[cs.profile]);
+    }
     oled.drawFastHLine(0, 9, 128, SSD1306_WHITE);
 
-    // ── Row 1: Temperature + Humidity ────────────────────────
+    // ── Row 1: Room Temp + Humidity ──────────────────────────
     oled.setCursor(0, 11);
-    oled.printf("T:");
-    if (sd.roomTempValid)
-        oled.printf("%.1f\xF8""C", sd.roomTemp);   // \xF8 = ° in cp437
-    else
-        oled.print("--.-");
+    if (sd.roomTempValid) oled.printf("T:%.1f\xF8""C", sd.roomTemp);
+    else                  oled.print("T:--.-");
 
-    oled.setCursor(70, 11);
-    oled.printf("H:");
-    if (sd.roomHumidValid)
-        oled.printf("%.0f%%", sd.roomHumidity);
-    else
-        oled.print("--");
+    oled.setCursor(68, 11);
+    if (sd.roomHumidValid) oled.printf("H:%.0f%%", sd.roomHumidity);
+    else                   oled.print("H:--");
 
-    // ── Row 2: Fan + AC setpoint ─────────────────────────────
+    // ── Row 2: Fan Level + AC Setpoint ───────────────────────
     oled.setCursor(0, 21);
-    oled.printf("Fan:%d%%", (int)(cs.fanDuty * 100 / 255));
+    oled.printf("Fan:L%d (%d%%)", cs.fanLevel, (int)(FAN_DUTIES[cs.fanLevel] * 100 / 255));
 
-    oled.setCursor(66, 21);
-    if (cs.acOn)
-        oled.printf("AC:%d\xF8""C", cs.acSetpoint);
-    else
-        oled.print("AC:OFF");
+    oled.setCursor(76, 21);
+    if (cs.acOn) oled.printf("AC:%d\xF8""C", cs.acSetpoint);
+    else         oled.print("AC:OFF");
 
-    // ── Row 3: Exhaust + Presence ────────────────────────────
+    // ── Row 3: Comfort Index + Target ────────────────────────
     oled.setCursor(0, 31);
-    oled.printf("Exh:%s", cs.exhaustOn ? "ON " : "OFF");
-    oled.setCursor(60, 31);
-    oled.printf("Pr:%s", sd.presenceDetected ? "YES" : "NO ");
+    oled.printf("CI:%.1f\xF8 (Tgt:%.1f\xF8)", cs.currentCI, cs.targetCI);
 
-    // ── Row 4: Bathroom humidity ─────────────────────────────
+    // ── Row 4: Presence + Bathroom Exhaust ───────────────────
     oled.setCursor(0, 41);
-    if (sd.bathHumidValid)
-        oled.printf("Bath H:%.0f%%", sd.bathHumidity);
-    else
-        oled.print("Bath H:--");
+    oled.printf("P:%s", sd.presenceDetected ? "YES" : "NO ");
+    if (sd.presenceDetected && sd.targetDistanceCm > 0) {
+        oled.printf("%dcm", sd.targetDistanceCm);
+    }
 
-    // Monsoon / override indicator
-    if (cs.monsoonMode) {
-        oled.setCursor(72, 41);
-        oled.print("MNSN");
-    }
-    if (cs.irOverride) {
-        oled.setCursor(96, 41);
-        oled.print("OVR");
-    }
+    oled.setCursor(76, 41);
+    oled.printf("Exh:%s", cs.exhaustOn ? "ON " : "OFF");
 
     // ── Row 5: Scrolling reason string ───────────────────────
     oled.drawFastHLine(0, 50, 128, SSD1306_WHITE);
 
-    // Reset scroll position when reason changes
     if (strcmp(cs.reason, lastReason) != 0) {
         strncpy(lastReason, cs.reason, sizeof(lastReason) - 1);
         scrollX = OLED_WIDTH;
     }
 
-    // Scroll at ~30 px/s (called every ~1 s, so advance 2 px)
     uint32_t now = millis();
     if (now - lastScrollMs >= 50) {
         lastScrollMs = now;
         scrollX -= 2;
-        int16_t textWidth = strlen(cs.reason) * 6;  // 6 px per char at size 1
+        int16_t textWidth = strlen(cs.reason) * 6;
         if (scrollX < -textWidth) scrollX = OLED_WIDTH;
     }
 
     oled.setCursor(scrollX, 54);
     oled.print(cs.reason);
 
-    // ── Alarm overlay ────────────────────────────────────────
-    if (cs.alarmActive) {
+    // ── Failsafe / Alarm Overlay ─────────────────────────────
+    if (cs.acNotResponding) {
+        oled.fillRect(0, 50, 128, 14, SSD1306_WHITE);
+        oled.setTextColor(SSD1306_BLACK);
+        oled.setCursor(4, 54);
+        oled.print("! AC NOT RESPONDING !");
+        oled.setTextColor(SSD1306_WHITE);
+    } else if (cs.sensorFaultHold) {
         oled.fillRect(0, 50, 128, 14, SSD1306_WHITE);
         oled.setTextColor(SSD1306_BLACK);
         oled.setCursor(8, 54);
-        oled.print("!! SENSOR ALARM !!");
+        oled.print("! SENSOR FAULT !");
         oled.setTextColor(SSD1306_WHITE);
     }
 

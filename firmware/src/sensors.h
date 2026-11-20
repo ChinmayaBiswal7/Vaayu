@@ -6,57 +6,52 @@
 #include <Adafruit_AHTX0.h>
 #include <DallasTemperature.h>
 #include <OneWire.h>
+#include <DHT.h>
 #include "config.h"
 
 // ── SensorData ───────────────────────────────────────────────
 struct SensorData {
     // Room AHT20 sensor
-    float roomTemp      = 25.0f;   // °C
-    float roomHumidity  = 50.0f;   // %RH
-    bool  roomTempValid    = false;
-    bool  roomHumidValid   = false;
+    float roomTemp          = 25.0f;   // °C
+    float roomHumidity      = 50.0f;   // %RH
+    bool  roomTempValid     = false;
+    bool  roomHumidValid    = false;
+    bool  roomSensorFault   = false;
 
-    // Bathroom DHT11 sensor (received via MQTT)
-    float bathTemp      = 25.0f;
-    float bathHumidity  = 50.0f;
-    bool  bathTempValid    = false;
-    bool  bathHumidValid   = false;
+    // Bathroom DHT11 sensor (wired to hub on GPIO 4)
+    float bathTemp          = 25.0f;
+    float bathHumidity      = 50.0f;
+    bool  bathTempValid     = false;
+    bool  bathHumidValid    = false;
+    bool  bathSensorFault   = false;
 
-    // DS18B20 at AC air outlet
-    float acOutletTemp  = 25.0f;
-    bool  acOutletValid = false;
+    // DS18B20 at AC air outlet (GPIO 27)
+    float acOutletTemp      = 25.0f;
+    bool  acOutletValid     = false;
 
-    // LD2410C radar
+    // HLK-LD2410C radar (GPIO 16 / 17)
     bool  presenceDetected  = false;
-    uint16_t targetDistanceCm = 300;  // last detected distance
+    uint16_t targetDistanceCm = 150;
     bool  radarValid        = false;
 
     // Timestamps of last valid read (millis)
-    unsigned long lastRoomTempMs    = 0;
-    unsigned long lastRoomHumidMs   = 0;
-    unsigned long lastBathHumidMs   = 0;
+    unsigned long lastRoomReadMs    = 0;
+    unsigned long lastBathReadMs    = 0;
     unsigned long lastAcOutletMs    = 0;
     unsigned long lastRadarMs       = 0;
 };
 
 // ── LD2410C frame parser state ───────────────────────────────
 struct RadarParser {
-    enum State { WAIT_AA, WAIT_FF1, WAIT_FF2, WAIT_FF3, IN_FRAME };
-    State state = WAIT_AA;
+    enum State { WAIT_HEADER_1, WAIT_HEADER_2, WAIT_HEADER_3, WAIT_HEADER_4, IN_FRAME };
+    State state = WAIT_HEADER_1;
     uint8_t buf[32];
     uint8_t idx = 0;
 };
 
 // ── Public API ───────────────────────────────────────────────
-
 void sensors_init();
-
-// Call once per TASK_SENSORS_MS cycle
 void sensors_read_room(SensorData& sd);
+void sensors_read_bathroom(SensorData& sd);
 void sensors_read_outlet(SensorData& sd);
-
-// Call continuously from TaskIR / TaskSensors — feeds serial bytes
 void sensors_process_radar_byte(uint8_t b, SensorData& sd);
-
-// Update bathroom values from MQTT callback
-void sensors_update_bathroom(float temp, float humidity, SensorData& sd);

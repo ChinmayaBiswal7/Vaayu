@@ -1,383 +1,353 @@
 // ============================================================
-//  control.cpp — Full Vaayu Hub state machine
-//
-//  Rules implemented (see config.h for all thresholds):
-//  1. Fan First: fan proportional to temp, AC after 10 min full fan
-//  2. AC Setpoint Creep: +1°C every 15 min while comfortable, max 28°C
-//  3. Empty Room Shut-off: fan off @5 min, AC off @10 min absence
-//  4. Exhaust Fan: bath humidity-driven with 2-min off delay
-//  5. Fail-safes: OOR hold + 30 s alarm, AC confirm via DS18B20, IR override
-//  6. Distance-aware fan, Monsoon mode (Dry AC mode)
+//  control.cpp — Reference implementation of Vaayu Hub rules
+//  Ported directly from Section 6 of VAAYU_CONTEXT.md
 // ============================================================
 #include "control.h"
 #include "ir_ac.h"
 #include <Arduino.h>
 #include <esp32-hal-ledc.h>
 
-// ── PWM helpers ──────────────────────────────────────────────
-static void fan_set(uint8_t duty) {
-    ledcWrite(FAN_PWM_CHANNEL, duty);
-}
-static void exhaust_set(uint8_t duty) {
-    ledcWrite(EXHAUST_PWM_CH, duty);
-}
-static void buzzer_beep(uint16_t durationMs) {
-    tone(PIN_BUZZER, BUZZER_FREQ_HZ, durationMs);
+// ── Physical Actuator Drivers ────────────────────────────────
+static void fan_set_level(uint8_t lvl) {
+    if (lvl >= FAN_LEVELS_COUNT) lvl = FAN_LEVELS_COUNT - 1;
+    ledcWrite(FAN_PWM_CHANNEL, FAN_DUTIES[lvl]);
 }
 
-// ── Map distance to a fan speed blend factor (0.0–1.0) ───────
-// Closer target → closer to 1.0 (full speed from temp calc)
-// Further target → down to 0.6 (60% of temp-driven speed)
-static float distance_blend(uint16_t distCm) {
-    if (distCm <= RADAR_DISTANCE_NEAR_CM) return 1.0f;
-    if (distCm >= RADAR_DISTANCE_FAR_CM)  return 0.6f;
-    float ratio = (float)(distCm - RADAR_DISTANCE_NEAR_CM) /
-                  (float)(RADAR_DISTANCE_FAR_CM - RADAR_DISTANCE_NEAR_CM);
-    return 1.0f - ratio * 0.4f;  // 1.0 → 0.6
+static void exhaust_set(bool on) {
+    ledcWrite(EXHAUST_PWM_CH, on ? 255 : 0);
 }
 
-// ── Compute temp-driven fan duty (0-255) ─────────────────────
-static uint8_t temp_to_fan_duty(float temp) {
-    if (temp <= TEMP_FAN_ON)  return 0;
-    if (temp >= TEMP_FAN_MAX) return 255;
-    float ratio = (temp - TEMP_FAN_ON) / (TEMP_FAN_MAX - TEMP_FAN_ON);
-    return (uint8_t)(ratio * 255.0f);
+static void buzzer_alert(bool on) {
+    digitalWrite(PIN_BUZZER, on ? HIGH : LOW);
 }
 
-// ── Sensor alarm check ───────────────────────────────────────
-static bool check_sensor_health(ControlState& cs, const SensorData& sd) {
-    unsigned long now = millis();
-    bool roomBad = !sd.roomTempValid ||
-                   (now - sd.lastRoomTempMs > DELAY_SENSOR_ALARM_MS + 5000UL);
-
-    if (roomBad) {
-        if (cs.sensorAlarmStartMs == 0) cs.sensorAlarmStartMs = now;
-        if (now - cs.sensorAlarmStartMs >= DELAY_SENSOR_ALARM_MS) {
-            return true;  // trigger alarm
-        }
-    } else {
-        cs.sensorAlarmStartMs = 0;
-    }
-    return false;
-}
-
-// ── Exhaust fan control ───────────────────────────────────────
-static void update_exhaust(ControlState& cs, const SensorData& sd) {
-    unsigned long now = millis();
-
-    if (!cs.exhaustOn) {
-        if (sd.bathHumidValid && sd.bathHumidity > HUMIDITY_EXHAUST_ON) {
-            cs.exhaustOn = true;
-            cs.exhaustLowHumidMs = 0;
-            exhaust_set(255);
-            Serial.println("[control] Exhaust ON (bath humidity high)");
-        }
-    } else {
-        // Exhaust is on — wait for humidity to drop AND stay low
-        if (sd.bathHumidValid && sd.bathHumidity < HUMIDITY_EXHAUST_OFF) {
-            if (cs.exhaustLowHumidMs == 0) cs.exhaustLowHumidMs = now;
-            if (now - cs.exhaustLowHumidMs >= DELAY_EXHAUST_OFF_MS) {
-                cs.exhaustOn = false;
-                cs.exhaustLowHumidMs = 0;
-                exhaust_set(0);
-                Serial.println("[control] Exhaust OFF (humidity normal)");
-            }
-        } else {
-            cs.exhaustLowHumidMs = 0;  // reset timer if humidity rises again
-        }
-    }
-}
-
-// ── Monsoon mode check ────────────────────────────────────────
-static void update_monsoon(ControlState& cs, const SensorData& sd) {
-    bool newMonsoon = sd.roomHumidValid && sd.roomHumidity > HUMIDITY_MONSOON;
-    if (newMonsoon != cs.monsoonMode) {
-        cs.monsoonMode = newMonsoon;
-        if (cs.acOn) {
-            // Resend AC command with updated mode
-            AcMode mode = cs.monsoonMode ? AC_MODE_DRY : AC_MODE_COOL;
-            ir_send_ac_command(mode, cs.acSetpoint, AC_FAN_AUTO);
-        }
-    }
-}
-
-// ── AC confirmation via DS18B20 ───────────────────────────────
-static void update_ac_confirm(ControlState& cs, const SensorData& sd) {
-    if (!cs.acConfirmPending) return;
-    unsigned long now = millis();
-    if (now - cs.acCommandSentMs < DELAY_AC_CONFIRM_MS) return;  // too early
-
-    if (!sd.acOutletValid) {
-        Serial.println("[control] DS18B20 not available for AC confirm");
-        cs.acConfirmPending = false;
-        return;
-    }
-
-    float drop = cs.acConfirmBaseline - sd.acOutletTemp;
-    if (drop >= AC_CONFIRM_DROP) {
-        cs.acConfirmed      = true;
-        cs.acConfirmPending = false;
-        cs.acResendCount    = 0;
-        Serial.printf("[control] AC confirmed (outlet dropped %.1f°C)\n", drop);
-    } else {
-        // Not confirmed
-        if (cs.acResendCount == 0) {
-            Serial.println("[control] AC not confirmed — resending command");
-            AcMode mode = cs.monsoonMode ? AC_MODE_DRY : AC_MODE_COOL;
-            ir_send_ac_command(mode, cs.acSetpoint, AC_FAN_AUTO);
-            cs.acCommandSentMs = now;
-            cs.acResendCount   = 1;
-        } else {
-            // Already retried — buzzer alarm
-            Serial.println("[control] AC still not confirmed after retry — buzzer!");
-            buzzer_beep(2000);
-            cs.acConfirmPending = false;
-        }
-    }
-}
-
-// ── IR override ───────────────────────────────────────────────
-void control_notify_ir_override(ControlState& cs) {
-    cs.irOverride          = true;
-    cs.irOverrideStartMs   = millis();
-    snprintf(cs.reason, sizeof(cs.reason), "Manual IR override (30 min)");
-    Serial.println("[control] IR override engaged");
-}
-
-// ── Manual dashboard commands ─────────────────────────────────
-void control_set_manual_fan(ControlState& cs, uint8_t pct) {
-    if (!cs.irOverride) return;  // only in override mode
-    cs.fanDuty = (uint8_t)(pct * 255U / 100U);
-    fan_set(cs.fanDuty);
-}
-void control_set_manual_ac_setpoint(ControlState& cs, int sp) {
-    cs.acSetpoint = constrain(sp, AC_SETPOINT_MIN, AC_SETPOINT_MAX);
-    if (cs.acOn) {
-        AcMode mode = cs.monsoonMode ? AC_MODE_DRY : AC_MODE_COOL;
-        ir_send_ac_command(mode, cs.acSetpoint, AC_FAN_AUTO);
-    }
-}
-void control_set_manual_ac_state(ControlState& cs, bool on) {
-    if (cs.acOn == on) return;
-    cs.acOn = on;
-    if (on) {
-        AcMode mode = cs.monsoonMode ? AC_MODE_DRY : AC_MODE_COOL;
-        ir_send_ac_command(mode, cs.acSetpoint, AC_FAN_AUTO);
-    } else {
-        ir_send_ac_command(AC_MODE_OFF, cs.acSetpoint, AC_FAN_AUTO);
-    }
+// ── Comfort Index Formula ────────────────────────────────────
+// CI = T + 0.05 * (RH - 50) - credit(v)
+// credit(v) = 2.5 * min(v / 0.8, 1.2)
+float control_compute_ci(float temp, float rh, uint8_t fanLvl) {
+    if (fanLvl >= FAN_LEVELS_COUNT) fanLvl = FAN_LEVELS_COUNT - 1;
+    float v = FAN_VELOCITIES[fanLvl];
+    float ratio = v / 0.8f;
+    float credit = 2.5f * (ratio < 1.2f ? ratio : 1.2f);
+    return temp + 0.05f * (rh - 50.0f) - credit;
 }
 
 // ── Initialisation ────────────────────────────────────────────
 void control_init(ControlState& cs) {
-    // L9110S Motor Driver: Room Fan (Channel A)
-    pinMode(PIN_FAN_IB, OUTPUT);
-    digitalWrite(PIN_FAN_IB, LOW);
+    // 1. Room Fan PWM (L9110S A-IA on GPIO 32)
     ledcSetup(FAN_PWM_CHANNEL, FAN_PWM_FREQ, FAN_PWM_BITS);
-    ledcAttachPin(PIN_FAN_IA, FAN_PWM_CHANNEL);
+    ledcAttachPin(PIN_FAN_PWM, FAN_PWM_CHANNEL);
+    fan_set_level(0);
 
-    // L9110S Motor Driver: Exhaust Fan (Channel B)
-    pinMode(PIN_EXHAUST_IB, OUTPUT);
-    digitalWrite(PIN_EXHAUST_IB, LOW);
+    // 2. Exhaust Fan PWM (L9110S B-IA on GPIO 14)
     ledcSetup(EXHAUST_PWM_CH, EXHAUST_PWM_FREQ, EXHAUST_PWM_BITS);
-    ledcAttachPin(PIN_EXHAUST_IA, EXHAUST_PWM_CH);
+    ledcAttachPin(PIN_EXHAUST_PWM, EXHAUST_PWM_CH);
+    exhaust_set(false);
 
-    // Buzzer
+    // 3. Buzzer (GPIO 19)
     pinMode(PIN_BUZZER, OUTPUT);
+    buzzer_alert(false);
 
-    fan_set(0);
-    exhaust_set(0);
-    snprintf(cs.reason, sizeof(cs.reason), "Booting...");
-    Serial.println("[control] Initialised for L9110S Motor Driver");
+    control_set_profile(cs, PROFILE_NORMAL);
+    snprintf(cs.reason, sizeof(cs.reason), "System Boot: Normal Profile");
+    Serial.println("[control] Initialised according to VAAYU_CONTEXT.md");
 }
 
-// ── Main control update ───────────────────────────────────────
-void control_update(ControlState& cs, const SensorData& sd) {
-    unsigned long now = millis();
+void control_set_profile(ControlState& cs, ComfortProfile cp) {
+    cs.profile     = cp;
+    cs.targetCI    = PROFILES[cp].targetCI;
+    cs.acSetpoint  = PROFILES[cp].acStartTemp;
+    cs.monsoonMode = PROFILES[cp].monsoonMode;
+}
 
-    // ── Exhaust and Monsoon are always evaluated ──────────────
-    update_exhaust(cs, sd);
-    update_monsoon(cs, sd);
-    update_ac_confirm(cs, sd);
+void control_set_fast_test(ControlState& cs, bool enable) {
+    cs.fastTestMode = enable;
+    Serial.printf("[control] Fast Test Mode %s (1 min = 5 s)\n", enable ? "ENABLED" : "DISABLED");
+}
 
-    // ── IR override window ────────────────────────────────────
-    if (cs.irOverride) {
-        if (now - cs.irOverrideStartMs >= DELAY_IR_OVERRIDE_MS) {
-            cs.irOverride = false;
-            Serial.println("[control] IR override expired — resuming auto");
-        } else {
-            snprintf(cs.reason, sizeof(cs.reason),
-                     "Manual override (%lu min left)",
-                     (DELAY_IR_OVERRIDE_MS - (now - cs.irOverrideStartMs)) / 60000UL);
-            return;  // Skip all automation
-        }
-    }
+void control_set_manual_fan(ControlState& cs, uint8_t level) {
+    cs.manualMode = true;
+    cs.fanLevel = min((int)level, 5);
+    fan_set_level(cs.fanLevel);
+}
 
-    // ── Sensor alarm ──────────────────────────────────────────
-    if (check_sensor_health(cs, sd)) {
-        if (cs.state != STATE_ALARM) {
-            cs.state       = STATE_ALARM;
-            cs.alarmActive = true;
-            buzzer_beep(500);
-            snprintf(cs.reason, sizeof(cs.reason), "ALARM: Sensor failure!");
-            Serial.println("[control] Entered ALARM state");
-        }
-        // Keep last fan/AC state; don't change hardware in alarm
+void control_set_manual_ac(ControlState& cs, bool on, int temp) {
+    cs.manualMode = true;
+    cs.acOn = on;
+    cs.acSetpoint = constrain(temp, 18, 30);
+    AcMode mode = cs.monsoonMode ? AC_MODE_DRY : AC_MODE_COOL;
+    ir_send_ac_command(on ? mode : AC_MODE_OFF, cs.acSetpoint, AC_FAN_AUTO);
+}
+
+void control_set_manual_exhaust(ControlState& cs, bool on) {
+    cs.exhaustOn = on;
+    exhaust_set(on);
+}
+
+void control_notify_ir_override(ControlState& cs, bool cooler) {
+    cs.overrideActive = true;
+    cs.overrideMinutesLeft = MANUAL_OVERRIDE_PAUSE_MIN;
+    cs.targetCI += cooler ? -MANUAL_OVERRIDE_SHIFT_CI : MANUAL_OVERRIDE_SHIFT_CI;
+    snprintf(cs.reason, sizeof(cs.reason), "Manual IR override: paused 30 min (target %.2f°C)", cs.targetCI);
+    Serial.println(cs.reason);
+}
+
+// ── Control Tick (Runs Once Per Minute or 5s in Fast-Test) ───
+void control_tick(ControlState& cs, const SensorData& sd) {
+    // ── 1. Sensor Fault Check ────────────────────────────────
+    if (sd.roomSensorFault || !sd.roomTempValid || !sd.roomHumidValid) {
+        cs.sensorFaultHold = true;
+        cs.alarmActive = true;
+        buzzer_alert(true);
+        snprintf(cs.reason, sizeof(cs.reason), "SENSOR FAULT: Holding last state");
+        Serial.println("[control] SENSOR FAULT DETECTED — holding state");
         return;
-    }
-    if (cs.state == STATE_ALARM) {
-        // Sensor recovered
-        cs.state       = STATE_IDLE;
-        cs.alarmActive = false;
-        snprintf(cs.reason, sizeof(cs.reason), "Sensor recovered");
-        buzzer_beep(100);
-    }
-
-    float temp     = sd.roomTemp;
-    float humidity = sd.roomHumidity;
-    bool  present  = sd.presenceDetected;
-
-    // ── Empty room detection ──────────────────────────────────
-    if (!present) {
-        if (cs.emptyDetectedMs == 0) {
-            cs.emptyDetectedMs = now;
+    } else {
+        if (cs.sensorFaultHold) {
+            buzzer_alert(false);
+            cs.sensorFaultHold = false;
+            cs.alarmActive = false;
         }
-        unsigned long emptyFor = now - cs.emptyDetectedMs;
-
-        if (emptyFor >= DELAY_EMPTY_AC_OFF_MS && cs.acOn) {
-            cs.acOn = false;
-            ir_send_ac_command(AC_MODE_OFF, cs.acSetpoint, AC_FAN_AUTO);
-            snprintf(cs.reason, sizeof(cs.reason),
-                     "Room empty >10 min — AC off");
-            Serial.println("[control] AC off: empty room");
-        }
-        if (emptyFor >= DELAY_EMPTY_FAN_OFF_MS && cs.fanDuty > 0) {
-            cs.fanDuty = 0;
-            fan_set(0);
-            cs.state   = STATE_EMPTY_COOLDOWN;
-            if (!cs.acOn)
-                snprintf(cs.reason, sizeof(cs.reason),
-                         "Room empty >5 min — fan off");
-            Serial.println("[control] Fan off: empty room");
-        }
-        return;  // Don't apply normal rules while empty
     }
 
-    // Room is occupied — reset empty timer
-    if (cs.emptyDetectedMs != 0) {
-        cs.emptyDetectedMs = 0;
-        Serial.println("[control] Presence restored");
-    }
-
-    // ── RULE 1: Fan-first logic ───────────────────────────────
-    uint8_t targetDuty = temp_to_fan_duty(temp);
-
-    // Distance-aware blend (only when presence is confirmed)
-    if (sd.radarValid && sd.presenceDetected) {
-        float blend = distance_blend(sd.targetDistanceCm);
-        targetDuty  = (uint8_t)(targetDuty * blend);
-    }
-
-    if (targetDuty == 0) {
-        // Comfortable — no fan needed
-        if (cs.fanDuty > 0) {
-            cs.fanDuty = 0;
-            fan_set(0);
-        }
-        if (cs.acOn) {
-            cs.acOn = false;
-            ir_send_ac_command(AC_MODE_OFF, cs.acSetpoint, AC_FAN_AUTO);
-            snprintf(cs.reason, sizeof(cs.reason),
-                     "Temp OK (%.1f°C) — all off", temp);
-        } else {
-            snprintf(cs.reason, sizeof(cs.reason),
-                     "Comfortable %.1f°C — idle", temp);
-        }
-        cs.state           = STATE_IDLE;
-        cs.fullFanSinceMs  = 0;
-        return;
-    }
-
-    // Fan is needed
-    cs.fanDuty = targetDuty;
-    fan_set(cs.fanDuty);
-
-    bool atFullFan = (targetDuty == 255);
-
-    if (atFullFan && cs.fullFanSinceMs == 0) {
-        cs.fullFanSinceMs = now;
-        Serial.println("[control] Full fan speed started");
-    }
-    if (!atFullFan) {
-        cs.fullFanSinceMs = 0;  // Reset if fan drops below 100%
-    }
-
-    // Should AC turn on?
-    if (!cs.acOn) {
-        bool fanTimerMet = atFullFan &&
-                           cs.fullFanSinceMs > 0 &&
-                           (now - cs.fullFanSinceMs >= DELAY_AC_ON_MS);
-        bool tempMet     = temp >= TEMP_AC_ON;
-
-        if (fanTimerMet && tempMet) {
-            cs.acOn          = true;
-            cs.state         = STATE_AC_RUNNING;
-            cs.acConfirmed   = false;
-            cs.acResendCount = 0;
-            cs.acConfirmPending  = true;
-            cs.acCommandSentMs   = now;
-            cs.acConfirmBaseline = sd.acOutletValid ? sd.acOutletTemp : temp;
-            cs.fullFanSinceMs    = 0;
-
-            AcMode mode = cs.monsoonMode ? AC_MODE_DRY : AC_MODE_COOL;
-            ir_send_ac_command(mode, cs.acSetpoint, AC_FAN_AUTO);
-
-            snprintf(cs.reason, sizeof(cs.reason),
-                     "AC ON @%d°C (%.1f°C, 10min full fan)", cs.acSetpoint, temp);
-            Serial.printf("[control] AC turned ON @%d°C\n", cs.acSetpoint);
-        } else {
-            cs.state = STATE_FAN_ONLY;
-            unsigned long remaining = 0;
-            if (atFullFan && cs.fullFanSinceMs > 0) {
-                unsigned long elapsed = now - cs.fullFanSinceMs;
-                if (elapsed < DELAY_AC_ON_MS)
-                    remaining = (DELAY_AC_ON_MS - elapsed) / 60000UL;
+    // ── 2. AC Command Check (DS18B20 Fail-safe) ──────────────
+    if (cs.acConfirmPending) {
+        cs.acConfirmElapsedMin++;
+        if (cs.acConfirmElapsedMin >= AC_CONFIRM_WAIT_MIN) {
+            bool confirmed = false;
+            if (!sd.acOutletValid) {
+                // If DS18B20 disconnected (-127), skip check per Section 6
+                confirmed = true;
+                Serial.println("[control] DS18B20 disconnected: skipping check");
+            } else {
+                if (cs.acConfirmExpectOn) {
+                    float dropThreshold = cs.monsoonMode ? AC_CONFIRM_DRY_DROP : AC_CONFIRM_COOL_DROP;
+                    confirmed = (sd.acOutletTemp <= sd.roomTemp - dropThreshold);
+                } else {
+                    confirmed = (sd.acOutletTemp >= sd.roomTemp - AC_CONFIRM_OFF_DELTA);
+                }
             }
-            if (remaining > 0)
-                snprintf(cs.reason, sizeof(cs.reason),
-                         "Fan 100%% (%.1f°C) — AC in %lu min", temp, remaining);
-            else
-                snprintf(cs.reason, sizeof(cs.reason),
-                         "Fan %d%% (%.1f°C)", (int)(targetDuty * 100 / 255), temp);
+
+            if (confirmed) {
+                cs.acConfirmPending = false;
+                cs.acNotResponding = false;
+                cs.acResendCount = 0;
+                Serial.println("[control] AC command confirmed by DS18B20");
+            } else {
+                if (cs.acResendCount == 0) {
+                    // Resend once
+                    cs.acResendCount = 1;
+                    cs.acConfirmElapsedMin = 0;
+                    AcMode mode = cs.acOn ? (cs.monsoonMode ? AC_MODE_DRY : AC_MODE_COOL) : AC_MODE_OFF;
+                    ir_send_ac_command(mode, cs.acSetpoint, AC_FAN_AUTO);
+                    snprintf(cs.reason, sizeof(cs.reason), "AC unconfirmed: resending command");
+                    Serial.println("[control] AC command unconfirmed — resending once");
+                } else {
+                    // Alarm: AC not responding
+                    cs.acConfirmPending = false;
+                    cs.acNotResponding = true;
+                    cs.alarmActive = true;
+                    buzzer_alert(true);
+                    snprintf(cs.reason, sizeof(cs.reason), "ALARM: AC NOT RESPONDING");
+                    Serial.println("[control] ALARM: AC NOT RESPONDING after resend");
+                }
+            }
+        }
+    }
+
+    // ── 3. Occupancy Tracking ────────────────────────────────
+    if (!sd.presenceDetected) {
+        cs.emptyMinutes++;
+        if (cs.emptyMinutes == OCCUPANCY_EMPTY_LOG_MIN) {
+            snprintf(cs.reason, sizeof(cs.reason), "Room confirmed empty (3 min)");
+            Serial.println("[control] Room confirmed empty");
+        } else if (cs.emptyMinutes == OCCUPANCY_FAN_OFF_MIN) {
+            cs.savedFanLevel = cs.fanLevel;
+            cs.fanLevel = 0;
+            fan_set_level(0);
+            snprintf(cs.reason, sizeof(cs.reason), "Empty 5 min: Fan turned off");
+            Serial.println(cs.reason);
+        } else if (cs.emptyMinutes >= OCCUPANCY_AC_OFF_MIN && cs.acOn) {
+            cs.savedAcOn = true;
+            cs.savedAcSetpoint = cs.acSetpoint;
+            cs.acOn = false;
+            ir_send_ac_command(AC_MODE_OFF, cs.acSetpoint, AC_FAN_AUTO);
+            cs.acConfirmPending = true;
+            cs.acConfirmExpectOn = false;
+            cs.acConfirmElapsedMin = 0;
+            cs.acResendCount = 0;
+            snprintf(cs.reason, sizeof(cs.reason), "Empty 10 min: AC shut down");
+            Serial.println(cs.reason);
+            cs.state = STATE_IDLE;
+            return;
         }
     } else {
-        // ── RULE 2: AC is running — setpoint creep ───────────
-        cs.state = STATE_AC_RUNNING;
+        if (cs.emptyMinutes >= OCCUPANCY_FAN_OFF_MIN) {
+            // Person returned! Restore fan immediately
+            cs.fanLevel = (cs.savedFanLevel > 0) ? cs.savedFanLevel : 1;
+            fan_set_level(cs.fanLevel);
+            snprintf(cs.reason, sizeof(cs.reason), "Presence returned: Fan restored (lvl %d)", cs.fanLevel);
+            Serial.println(cs.reason);
+        }
+        cs.emptyMinutes = 0;
+    }
 
-        if (temp <= TEMP_AC_CREEP) {
-            if (cs.lastCreepMs == 0) cs.lastCreepMs = now;
-            if (now - cs.lastCreepMs >= DELAY_AC_CREEP_MS) {
-                if (cs.acSetpoint < AC_SETPOINT_MAX) {
-                    cs.acSetpoint++;
-                    cs.lastCreepMs = now;
-                    AcMode mode = cs.monsoonMode ? AC_MODE_DRY : AC_MODE_COOL;
-                    ir_send_ac_command(mode, cs.acSetpoint, AC_FAN_AUTO);
-                    snprintf(cs.reason, sizeof(cs.reason),
-                             "AC creep → %d°C setpoint (comfortable)", cs.acSetpoint);
-                    Serial.printf("[control] AC setpoint crept to %d°C\n", cs.acSetpoint);
-                } else {
-                    snprintf(cs.reason, sizeof(cs.reason),
-                             "AC %d°C (max setpoint, comfortable)", cs.acSetpoint);
-                }
+    // ── 4. Manual Override Pause ─────────────────────────────
+    if (cs.overrideActive) {
+        cs.overrideMinutesLeft--;
+        if (cs.overrideMinutesLeft <= 0) {
+            cs.overrideActive = false;
+            snprintf(cs.reason, sizeof(cs.reason), "Manual pause ended: resuming auto");
+            Serial.println(cs.reason);
+        } else {
+            return; // Do nothing while manual pause active
+        }
+    }
+
+    // Skip automated ladder if manual mode or empty shutoff
+    if (cs.manualMode || cs.emptyMinutes >= OCCUPANCY_FAN_OFF_MIN) return;
+
+    // ── 5. Fan-First Comfort Ladder ──────────────────────────
+    uint8_t maxFan = PROFILES[cs.profile].maxFanLevel;
+    cs.currentCI = control_compute_ci(sd.roomTemp, sd.roomHumidity, cs.fanLevel);
+
+    if (cs.currentCI > cs.targetCI + 0.5f && cs.fanLevel < maxFan) {
+        cs.fanLevel++;
+        fan_set_level(cs.fanLevel);
+        cs.currentCI = control_compute_ci(sd.roomTemp, sd.roomHumidity, cs.fanLevel);
+        snprintf(cs.reason, sizeof(cs.reason), "Fan up to level %d (CI %.1f > %.1f)", cs.fanLevel, cs.currentCI, cs.targetCI);
+    } else if (cs.fanLevel > 0) {
+        float ciLower = control_compute_ci(sd.roomTemp, sd.roomHumidity, cs.fanLevel - 1);
+        if (ciLower <= cs.targetCI + 0.2f) {
+            cs.fanLevel--;
+            fan_set_level(cs.fanLevel);
+            cs.currentCI = control_compute_ci(sd.roomTemp, sd.roomHumidity, cs.fanLevel);
+            snprintf(cs.reason, sizeof(cs.reason), "Fan down to level %d (CI %.1f comfortable)", cs.fanLevel, cs.currentCI);
+        }
+    }
+
+    // ── 6. Monsoon Mode Check (Humid Profile) ────────────────
+    if (cs.profile == PROFILE_HUMID) {
+        if (sd.roomHumidity > 70.0f && sd.roomTemp >= 26.0f && sd.roomTemp <= 30.0f) {
+            if (!cs.monsoonMode) {
+                cs.monsoonMode = true;
+                if (cs.acOn) ir_send_ac_command(AC_MODE_DRY, cs.acSetpoint, AC_FAN_AUTO);
+            }
+        } else if (cs.monsoonMode && (sd.roomTemp > 30.0f || sd.roomHumidity < 60.0f)) {
+            cs.monsoonMode = false;
+            if (cs.acOn) ir_send_ac_command(AC_MODE_COOL, cs.acSetpoint, AC_FAN_AUTO);
+        }
+    }
+
+    // ── 7. AC Activation (Rule 1: 10 min at full fan) ────────
+    if (!cs.acOn) {
+        if (cs.fanLevel == maxFan && cs.currentCI > cs.targetCI + 0.5f) {
+            cs.fullFanMinutes++;
+            if (cs.fullFanMinutes >= AC_FULL_FAN_TRIGGER_MIN) {
+                // Check compressor lockout
+                cs.acOn = true;
+                cs.acSetpoint = PROFILES[cs.profile].acStartTemp;
+                AcMode mode = cs.monsoonMode ? AC_MODE_DRY : AC_MODE_COOL;
+                ir_send_ac_command(mode, cs.acSetpoint, AC_FAN_AUTO);
+
+                cs.acConfirmPending = true;
+                cs.acConfirmExpectOn = true;
+                cs.acConfirmElapsedMin = 0;
+                cs.acResendCount = 0;
+                cs.fullFanMinutes = 0;
+                cs.comfortMinutes = 0;
+                cs.state = STATE_AC_RUNNING;
+                snprintf(cs.reason, sizeof(cs.reason), "Full fan 10 min: AC ON at %d°C", cs.acSetpoint);
+                Serial.println(cs.reason);
             } else {
-                unsigned long nextCreep = (DELAY_AC_CREEP_MS - (now - cs.lastCreepMs)) / 60000UL;
-                snprintf(cs.reason, sizeof(cs.reason),
-                         "AC %d°C, creep in %lu min", cs.acSetpoint, nextCreep);
+                snprintf(cs.reason, sizeof(cs.reason), "Fan at max: AC countdown (%d/10 min)", cs.fullFanMinutes);
             }
         } else {
-            cs.lastCreepMs = 0;
-            snprintf(cs.reason, sizeof(cs.reason),
-                     "AC %d°C, cooling (%.1f°C)", cs.acSetpoint, temp);
+            cs.fullFanMinutes = 0;
+            cs.state = (cs.fanLevel > 0) ? STATE_FAN_ONLY : STATE_IDLE;
+        }
+    } else {
+        // ── 8. AC Set-Point Creep (Rule 2: 15 min comfortable) ──
+        cs.state = STATE_AC_RUNNING;
+        if (cs.currentCI <= cs.targetCI + 0.5f) {
+            cs.comfortMinutes++;
+            if (cs.comfortMinutes >= AC_SETPOINT_CREEP_MIN) {
+                int cap = PROFILES[cs.profile].acCapTemp;
+                if (cs.acSetpoint < cap) {
+                    cs.acSetpoint++;
+                    AcMode mode = cs.monsoonMode ? AC_MODE_DRY : AC_MODE_COOL;
+                    ir_send_ac_command(mode, cs.acSetpoint, AC_FAN_AUTO);
+                    snprintf(cs.reason, sizeof(cs.reason), "Comfortable 15 min: AC creep to %d°C", cs.acSetpoint);
+                    Serial.println(cs.reason);
+                } else {
+                    snprintf(cs.reason, sizeof(cs.reason), "AC at %d°C cap (maximum energy saving)", cs.acSetpoint);
+                }
+                cs.comfortMinutes = 0;
+            } else {
+                snprintf(cs.reason, sizeof(cs.reason), "AC %d°C: creep countdown (%d/15 min)", cs.acSetpoint, cs.comfortMinutes);
+            }
+            cs.hotMinutes = 0;
+        } else {
+            cs.comfortMinutes = 0;
+            // ── 9. Give Some Back (Rule 9: 10 min hot at max fan) ─
+            if (cs.fanLevel == maxFan && cs.currentCI > cs.targetCI + 1.0f) {
+                cs.hotMinutes++;
+                if (cs.hotMinutes >= AC_GIVE_BACK_MIN) {
+                    int startTemp = PROFILES[cs.profile].acStartTemp;
+                    if (cs.acSetpoint > startTemp) {
+                        cs.acSetpoint--;
+                        AcMode mode = cs.monsoonMode ? AC_MODE_DRY : AC_MODE_COOL;
+                        ir_send_ac_command(mode, cs.acSetpoint, AC_FAN_AUTO);
+                        snprintf(cs.reason, sizeof(cs.reason), "Hot 10 min: AC lower to %d°C", cs.acSetpoint);
+                    }
+                    cs.hotMinutes = 0;
+                }
+            } else {
+                cs.hotMinutes = 0;
+            }
+        }
+    }
+
+    // ── 10. Bathroom Exhaust Rules (DHT11) ────────────────────
+    if (sd.bathHumidValid && !sd.bathSensorFault) {
+        if (!cs.exhaustOn) {
+            // Update rolling 30-min EMA baseline while exhaust is off
+            cs.bathEmaBaseline += EXHAUST_EMA_ALPHA * (sd.bathHumidity - cs.bathEmaBaseline);
+
+            // ON if humidity rises >= 8% or > 75% and >= 3% above baseline
+            bool spike = (sd.bathHumidity >= cs.bathEmaBaseline + EXHAUST_TRIGGER_SPIKE);
+            bool highHumid = (sd.bathHumidity >= EXHAUST_TRIGGER_HIGH_RH && sd.bathHumidity >= cs.bathEmaBaseline + EXHAUST_TRIGGER_HIGH_DELTA);
+
+            if (spike || highHumid) {
+                cs.exhaustOn = true;
+                cs.exhaustRuntimeMin = 0;
+                cs.exhaustLowMin = 0;
+                exhaust_set(true);
+                snprintf(cs.reason, sizeof(cs.reason), "Bathroom steam: Exhaust ON (%.1f%%)", sd.bathHumidity);
+                Serial.println(cs.reason);
+            }
+        } else {
+            cs.exhaustRuntimeMin++;
+            // Hard 45 min runtime limit
+            if (cs.exhaustRuntimeMin >= EXHAUST_MAX_RUNTIME_MIN) {
+                cs.exhaustOn = false;
+                exhaust_set(false);
+                snprintf(cs.reason, sizeof(cs.reason), "Exhaust OFF: 45 min limit reached");
+                Serial.println(cs.reason);
+            } else {
+                // OFF once within 3% of baseline for 2 min in a row
+                if (sd.bathHumidity <= cs.bathEmaBaseline + EXHAUST_OFF_DELTA) {
+                    cs.exhaustLowMin++;
+                    if (cs.exhaustLowMin >= EXHAUST_OFF_STABLE_MIN) {
+                        cs.exhaustOn = false;
+                        exhaust_set(false);
+                        snprintf(cs.reason, sizeof(cs.reason), "Bathroom recovered: Exhaust OFF");
+                        Serial.println(cs.reason);
+                    }
+                } else {
+                    cs.exhaustLowMin = 0;
+                }
+            }
         }
     }
 }

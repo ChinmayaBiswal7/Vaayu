@@ -6,25 +6,30 @@
 
 // ── Static objects ───────────────────────────────────────────
 static Adafruit_AHTX0 aht20;
+static DHT            dht11(PIN_DHT11, DHT11);
 static OneWire        oneWire(PIN_DS18B20);
 static DallasTemperature ds18b20(&oneWire);
 static RadarParser    radarParser;
 
-// Last accepted (good) readings for outlier rejection
+// Last accepted readings for outlier rejection
 static float lastGoodRoomTemp     = 25.0f;
 static float lastGoodRoomHumidity = 50.0f;
 static float lastGoodAcOutlet     = 25.0f;
-static float lastGoodBathTemp     = 25.0f;
 static float lastGoodBathHumidity = 50.0f;
 
-// ── Helper: range + outlier check ───────────────────────────
+// Stuck-sensor tracking (10 min check)
+static float lastTrackedTemp      = -999.0f;
+static unsigned long tempSameSinceMs = 0;
+
+// ── Helpers ──────────────────────────────────────────────────
 static bool temp_valid(float v, float lastGood) {
-    if (v < TEMP_VALID_MIN || v > TEMP_VALID_MAX)        return false;
+    if (isnan(v) || v < TEMP_VALID_MIN || v > TEMP_VALID_MAX) return false;
     if (lastGood != 0 && fabsf(v - lastGood) > TEMP_OUTLIER_DELTA) return false;
     return true;
 }
+
 static bool humid_valid(float v, float lastGood) {
-    if (v < HUMIDITY_VALID_MIN || v > HUMIDITY_VALID_MAX) return false;
+    if (isnan(v) || v < HUMIDITY_VALID_MIN || v > HUMIDITY_VALID_MAX) return false;
     if (lastGood != 0 && fabsf(v - lastGood) > HUMIDITY_OUTLIER_DELTA) return false;
     return true;
 }
@@ -33,156 +38,152 @@ static bool humid_valid(float v, float lastGood) {
 void sensors_init() {
     Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
 
-    // AHT20 Room Temp / Humidity Sensor
+    // 1. Room AHT20
     if (!aht20.begin()) {
-        Serial.println("[sensors] AHT20 not found — check I2C wiring (SDA=21, SCL=22)");
+        Serial.println("[sensors] AHT20 not found at 0x38 (check SDA=21, SCL=22)");
     } else {
-        Serial.println("[sensors] AHT20 OK");
+        Serial.println("[sensors] AHT20 Room Sensor OK");
     }
 
-    // DS18B20
-    ds18b20.begin();
-    ds18b20.setResolution(12);
-    ds18b20.setWaitForConversion(false);  // non-blocking
-    ds18b20.requestTemperatures();
-    Serial.printf("[sensors] DS18B20: %d device(s)\n", ds18b20.getDeviceCount());
+    // 2. Bathroom DHT11
+    dht11.begin();
+    Serial.println("[sensors] DHT11 Bathroom Sensor OK (GPIO 4)");
 
-    // Radar UART
+    // 3. DS18B20 AC Outlet Probe
+    ds18b20.begin();
+    ds18b20.setResolution(11);
+    ds18b20.setWaitForConversion(false);
+    ds18b20.requestTemperatures();
+    Serial.printf("[sensors] DS18B20 count: %d (GPIO 27)\n", ds18b20.getDeviceCount());
+
+    // 4. HLK-LD2410C Radar UART2
     Serial2.begin(RADAR_BAUD, SERIAL_8N1, PIN_RADAR_RX, PIN_RADAR_TX);
-    Serial.println("[sensors] Radar UART2 started");
+    Serial.println("[sensors] HLK-LD2410C Radar UART2 started (RX=16, TX=17)");
 }
 
-// ── Room AHT20 ───────────────────────────────────────────────
+// ── Room AHT20 Read ──────────────────────────────────────────
 void sensors_read_room(SensorData& sd) {
     sensors_event_t hum_ev, temp_ev;
     if (!aht20.getEvent(&hum_ev, &temp_ev)) {
-        Serial.println("[sensors] AHT20 read failed");
-        return;
-    }
-        Serial.println("[sensors] SHT41 read failed");
+        sd.roomTempValid  = false;
+        sd.roomHumidValid = false;
+        sd.roomSensorFault = true;
         return;
     }
 
     float t = temp_ev.temperature;
     float h = hum_ev.relative_humidity;
+    unsigned long now = millis();
 
+    // Check outlier
     if (temp_valid(t, lastGoodRoomTemp)) {
-        lastGoodRoomTemp  = t;
-        sd.roomTemp       = t;
-        sd.roomTempValid  = true;
-        sd.lastRoomTempMs = millis();
+        lastGoodRoomTemp = t;
+        sd.roomTemp = t;
+        sd.roomTempValid = true;
+
+        // Stuck sensor check (same reading for > 10 min)
+        if (fabsf(t - lastTrackedTemp) < 0.05f) {
+            if (tempSameSinceMs == 0) tempSameSinceMs = now;
+            if (now - tempSameSinceMs > (SENSOR_STUCK_TIMEOUT_MIN * 60000UL)) {
+                sd.roomSensorFault = true; // Flag stuck sensor!
+            }
+        } else {
+            lastTrackedTemp = t;
+            tempSameSinceMs = now;
+            sd.roomSensorFault = false;
+        }
     } else {
-        Serial.printf("[sensors] Room temp rejected: %.1f°C\n", t);
-        // Keep last good value — flag still reflects prior success
+        Serial.printf("[sensors] Room temp rejected outlier: %.1f\n", t);
     }
 
     if (humid_valid(h, lastGoodRoomHumidity)) {
         lastGoodRoomHumidity = h;
-        sd.roomHumidity      = h;
-        sd.roomHumidValid    = true;
-        sd.lastRoomHumidMs   = millis();
-    } else {
-        Serial.printf("[sensors] Room humidity rejected: %.1f%%\n", h);
+        sd.roomHumidity = h;
+        sd.roomHumidValid = true;
     }
+
+    sd.lastRoomReadMs = now;
 }
 
-// ── DS18B20 AC outlet ────────────────────────────────────────
+// ── Bathroom DHT11 Read ──────────────────────────────────────
+void sensors_read_bathroom(SensorData& sd) {
+    float h = dht11.readHumidity();
+    float t = dht11.readTemperature();
+    unsigned long now = millis();
+
+    if (isnan(h) || isnan(t) || h < 1.0f || h > 100.0f) {
+        // If not responding for > 10 min, flag fault
+        if (now - sd.lastBathReadMs > (EXHAUST_SENSOR_TIMEOUT_MIN * 60000UL) && sd.lastBathReadMs != 0) {
+            sd.bathSensorFault = true;
+        }
+        return;
+    }
+
+    sd.bathTemp = t;
+    sd.bathTempValid = true;
+    sd.bathHumidity = h;
+    sd.bathHumidValid = true;
+    sd.bathSensorFault = false;
+    sd.lastBathReadMs = now;
+}
+
+// ── DS18B20 AC Outlet Read ───────────────────────────────────
 void sensors_read_outlet(SensorData& sd) {
-    // Collect previous async request
     float t = ds18b20.getTempCByIndex(0);
+    ds18b20.requestTemperatures(); // Trigger next async read
 
-    // Kick off next conversion for next cycle
-    ds18b20.requestTemperatures();
-
-    if (t == DEVICE_DISCONNECTED_C || t == 85.0f) {
-        Serial.println("[sensors] DS18B20 disconnected or power-on reset");
+    if (t == DEVICE_DISCONNECTED_C || t == 85.0f || t < -50.0f) {
         sd.acOutletValid = false;
         return;
     }
-    if (temp_valid(t, lastGoodAcOutlet)) {
-        lastGoodAcOutlet    = t;
-        sd.acOutletTemp     = t;
-        sd.acOutletValid    = true;
-        sd.lastAcOutletMs   = millis();
-    } else {
-        Serial.printf("[sensors] DS18B20 outlier rejected: %.1f°C\n", t);
-    }
+
+    sd.acOutletTemp = t;
+    sd.acOutletValid = true;
+    sd.lastAcOutletMs = millis();
 }
 
-// ── LD2410C UART frame parser ────────────────────────────────
-//
-// Frame format (basic energy report):
-//   Header:  0xF4 0xF3 0xF2 0xF1
-//   Length:  2 bytes LE
-//   Data:    variable
-//   Footer:  0xF8 0xF7 0xF6 0xF5
-//
-// We watch for the simpler "basic" data frame:
-//   0xAA  <data_type>  <head_flag>  <target_state>
-//         <move_dist_H> <move_dist_L>  <move_energy>
-//         <still_dist_H> <still_dist_L> <still_energy>
-//         <detect_dist_H> <detect_dist_L>
-//   0x55  0x00
-//
-// target_state: 0=no target, 1=moving, 2=stationary, 3=both
-//
+// ── HLK-LD2410C Radar Parser ─────────────────────────────────
+// Watches for frame header: 0xF4, 0xF3, 0xF2, 0xF1
 void sensors_process_radar_byte(uint8_t b, SensorData& sd) {
-    RadarParser& p = radarParser;
-
-    switch (p.state) {
-    case RadarParser::WAIT_AA:
-        if (b == 0xAA) { p.idx = 0; p.buf[p.idx++] = b; p.state = RadarParser::IN_FRAME; }
-        break;
-
-    case RadarParser::IN_FRAME:
-        if (p.idx < sizeof(p.buf)) p.buf[p.idx++] = b;
-
-        // Check for end-of-frame: 0x55 0x00 at bytes [13] [14]
-        if (p.idx >= 15 && p.buf[p.idx - 2] == 0x55 && p.buf[p.idx - 1] == 0x00) {
-            // Parse: buf[0]=0xAA, buf[1]=data_type, buf[2]=head, buf[3]=target_state
-            uint8_t targetState = p.buf[3];
-            uint16_t moveDist   = ((uint16_t)p.buf[4] << 8) | p.buf[5];
-            uint16_t stillDist  = ((uint16_t)p.buf[7] << 8) | p.buf[8];
-            uint16_t detDist    = ((uint16_t)p.buf[10] << 8) | p.buf[11];
-
-            sd.presenceDetected = (targetState != 0);
-            if (sd.presenceDetected) {
-                // Use closest of moving / stationary distances
-                uint16_t dist = moveDist;
-                if (targetState == 2 || (targetState == 3 && stillDist < dist)) dist = stillDist;
-                if (dist == 0) dist = detDist;
-                sd.targetDistanceCm = dist;
+    switch (radarParser.state) {
+        case RadarParser::WAIT_HEADER_1:
+            if (b == 0xF4) radarParser.state = RadarParser::WAIT_HEADER_2;
+            break;
+        case RadarParser::WAIT_HEADER_2:
+            radarParser.state = (b == 0xF3) ? RadarParser::WAIT_HEADER_3 : RadarParser::WAIT_HEADER_1;
+            break;
+        case RadarParser::WAIT_HEADER_3:
+            radarParser.state = (b == 0xF2) ? RadarParser::WAIT_HEADER_4 : RadarParser::WAIT_HEADER_1;
+            break;
+        case RadarParser::WAIT_HEADER_4:
+            if (b == 0xF1) {
+                radarParser.state = RadarParser::IN_FRAME;
+                radarParser.idx = 0;
+            } else {
+                radarParser.state = RadarParser::WAIT_HEADER_1;
             }
-            sd.radarValid   = true;
-            sd.lastRadarMs  = millis();
-            p.state = RadarParser::WAIT_AA;
-            p.idx   = 0;
-        }
+            break;
+        case RadarParser::IN_FRAME:
+            radarParser.buf[radarParser.idx++] = b;
+            if (radarParser.idx >= 12) {
+                // Parse standard report:
+                // byte 4: target state (0x00=none, 0x01=moving, 0x02=stationary, 0x03=both)
+                // byte 5-6: moving target distance (LE uint16)
+                // byte 7-8: stationary target distance (LE uint16)
+                uint8_t targetState = radarParser.buf[4];
+                uint16_t moveDist   = radarParser.buf[5] | (radarParser.buf[6] << 8);
+                uint16_t statDist   = radarParser.buf[7] | (radarParser.buf[8] << 8);
 
-        // Safety reset if buffer fills without end marker
-        if (p.idx >= sizeof(p.buf)) {
-            p.state = RadarParser::WAIT_AA;
-            p.idx   = 0;
-        }
-        break;
+                sd.presenceDetected = (targetState > 0);
+                if (targetState == 0x01)      sd.targetDistanceCm = moveDist;
+                else if (targetState == 0x02) sd.targetDistanceCm = statDist;
+                else if (targetState == 0x03) sd.targetDistanceCm = min(moveDist, statDist);
+                else                          sd.targetDistanceCm = 0;
 
-    default:
-        p.state = RadarParser::WAIT_AA;
-        break;
-    }
-}
-
-// ── Bathroom MQTT update ─────────────────────────────────────
-void sensors_update_bathroom(float temp, float humidity, SensorData& sd) {
-    if (temp_valid(temp, lastGoodBathTemp)) {
-        lastGoodBathTemp  = temp;
-        sd.bathTemp       = temp;
-        sd.bathTempValid  = true;
-    }
-    if (humid_valid(humidity, lastGoodBathHumidity)) {
-        lastGoodBathHumidity = humidity;
-        sd.bathHumidity      = humidity;
-        sd.bathHumidValid    = true;
-        sd.lastBathHumidMs   = millis();
+                sd.radarValid = true;
+                sd.lastRadarMs = millis();
+                radarParser.state = RadarParser::WAIT_HEADER_1;
+            }
+            break;
     }
 }
