@@ -170,17 +170,17 @@ void control_set_manual_ac_state(ControlState& cs, bool on) {
 
 // ── Initialisation ────────────────────────────────────────────
 void control_init(ControlState& cs) {
-    // Fan PWM
+    // L9110S Motor Driver: Room Fan (Channel A)
+    pinMode(PIN_FAN_IB, OUTPUT);
+    digitalWrite(PIN_FAN_IB, LOW);
     ledcSetup(FAN_PWM_CHANNEL, FAN_PWM_FREQ, FAN_PWM_BITS);
-    ledcAttachPin(PIN_FAN_PWM, FAN_PWM_CHANNEL);
-    pinMode(PIN_FAN_IN1, OUTPUT); digitalWrite(PIN_FAN_IN1, HIGH);
-    pinMode(PIN_FAN_IN2, OUTPUT); digitalWrite(PIN_FAN_IN2, LOW);
+    ledcAttachPin(PIN_FAN_IA, FAN_PWM_CHANNEL);
 
-    // Exhaust PWM
+    // L9110S Motor Driver: Exhaust Fan (Channel B)
+    pinMode(PIN_EXHAUST_IB, OUTPUT);
+    digitalWrite(PIN_EXHAUST_IB, LOW);
     ledcSetup(EXHAUST_PWM_CH, EXHAUST_PWM_FREQ, EXHAUST_PWM_BITS);
-    ledcAttachPin(PIN_EXHAUST_PWM, EXHAUST_PWM_CH);
-    pinMode(PIN_EXHAUST_IN3, OUTPUT); digitalWrite(PIN_EXHAUST_IN3, HIGH);
-    pinMode(PIN_EXHAUST_IN4, OUTPUT); digitalWrite(PIN_EXHAUST_IN4, LOW);
+    ledcAttachPin(PIN_EXHAUST_IA, EXHAUST_PWM_CH);
 
     // Buzzer
     pinMode(PIN_BUZZER, OUTPUT);
@@ -188,7 +188,7 @@ void control_init(ControlState& cs) {
     fan_set(0);
     exhaust_set(0);
     snprintf(cs.reason, sizeof(cs.reason), "Booting...");
-    Serial.println("[control] Initialised");
+    Serial.println("[control] Initialised for L9110S Motor Driver");
 }
 
 // ── Main control update ───────────────────────────────────────

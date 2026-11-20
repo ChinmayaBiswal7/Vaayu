@@ -5,7 +5,7 @@
 #include <Wire.h>
 
 // ── Static objects ───────────────────────────────────────────
-static Adafruit_SHT4x sht41;
+static Adafruit_AHTX0 aht20;
 static OneWire        oneWire(PIN_DS18B20);
 static DallasTemperature ds18b20(&oneWire);
 static RadarParser    radarParser;
@@ -33,13 +33,11 @@ static bool humid_valid(float v, float lastGood) {
 void sensors_init() {
     Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
 
-    // SHT41
-    if (!sht41.begin()) {
-        Serial.println("[sensors] SHT41 not found — check wiring");
+    // AHT20 Room Temp / Humidity Sensor
+    if (!aht20.begin()) {
+        Serial.println("[sensors] AHT20 not found — check I2C wiring (SDA=21, SCL=22)");
     } else {
-        sht41.setPrecision(SHT4X_HIGH_PRECISION);
-        sht41.setHeater(SHT4X_NO_HEATER);
-        Serial.println("[sensors] SHT41 OK");
+        Serial.println("[sensors] AHT20 OK");
     }
 
     // DS18B20
@@ -54,10 +52,13 @@ void sensors_init() {
     Serial.println("[sensors] Radar UART2 started");
 }
 
-// ── Room SHT41 ───────────────────────────────────────────────
+// ── Room AHT20 ───────────────────────────────────────────────
 void sensors_read_room(SensorData& sd) {
     sensors_event_t hum_ev, temp_ev;
-    if (!sht41.getEvent(&hum_ev, &temp_ev)) {
+    if (!aht20.getEvent(&hum_ev, &temp_ev)) {
+        Serial.println("[sensors] AHT20 read failed");
+        return;
+    }
         Serial.println("[sensors] SHT41 read failed");
         return;
     }

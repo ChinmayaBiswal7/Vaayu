@@ -3,20 +3,20 @@
 //  sensors.h — Sensor data structures and read interfaces
 // ============================================================
 #include <Arduino.h>
-#include <Adafruit_SHT4x.h>
+#include <Adafruit_AHTX0.h>
 #include <DallasTemperature.h>
 #include <OneWire.h>
 #include "config.h"
 
 // ── SensorData ───────────────────────────────────────────────
 struct SensorData {
-    // Room SHT41
+    // Room AHT20 sensor
     float roomTemp      = 25.0f;   // °C
     float roomHumidity  = 50.0f;   // %RH
     bool  roomTempValid    = false;
     bool  roomHumidValid   = false;
 
-    // Bathroom SHT41 (received via MQTT)
+    // Bathroom DHT11 sensor (received via MQTT)
     float bathTemp      = 25.0f;
     float bathHumidity  = 50.0f;
     bool  bathTempValid    = false;

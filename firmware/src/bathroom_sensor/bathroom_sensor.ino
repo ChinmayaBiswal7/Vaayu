@@ -2,27 +2,31 @@
 //  bathroom_sensor.ino — Wemos D1 Mini sketch
 //
 //  Hardware:
-//    Wemos D1 Mini (ESP8266) + SHT41 on I2C (SDA=D2, SCL=D1)
+//    Wemos D1 Mini (ESP8266) + DHT11 sensor on Pin D4 (GPIO 2)
 //
 //  Publishes to MQTT every 30 s:
 //    vaayu/bathroom/temp     → float string (°C)
 //    vaayu/bathroom/humidity → float string (%RH)
 //
 //  Dependencies (install via Arduino Library Manager):
-//    - Adafruit SHT4x Library
+//    - DHT sensor library (Adafruit)
+//    - Adafruit Unified Sensor
 //    - PubSubClient (knolleary)
 //    - ESP8266WiFi (bundled with ESP8266 board package)
 // ============================================================
 
 #include <ESP8266WiFi.h>
 #include <PubSubClient.h>
-#include <Wire.h>
-#include <Adafruit_SHT4x.h>
+#include <DHT.h>
+
+// ── Pin definitions ──────────────────────────────────────────
+#define DHTPIN        D4       // GPIO 2 on Wemos D1 Mini
+#define DHTTYPE       DHT11    // DHT 11
 
 // ── Configuration — edit before flashing ────────────────────
 const char* WIFI_SSID     = "YourSSID";       // ← change
 const char* WIFI_PASSWORD = "YourPassword";    // ← change
-const char* MQTT_BROKER   = "192.168.1.100";  // ← Vaayu Hub or broker IP
+const char* MQTT_BROKER   = "192.168.29.208"; // ← Vaayu Hub or broker IP
 const int   MQTT_PORT     = 1883;
 const char* MQTT_CLIENT   = "vaayu-bathroom";
 
@@ -36,7 +40,7 @@ const unsigned long PUB_INTERVAL = 30000;
 // ── Globals ──────────────────────────────────────────────────
 WiFiClient   wifiClient;
 PubSubClient mqtt(wifiClient);
-Adafruit_SHT4x sht41;
+DHT          dht(DHTPIN, DHTTYPE);
 
 unsigned long lastPubMs = 0;
 
@@ -59,7 +63,7 @@ void mqtt_reconnect() {
         if (mqtt.connect(MQTT_CLIENT)) {
             Serial.println("OK");
         } else {
-            Serial.printf("failed (%d) — retry in 5s\n", mqtt.state());
+            Serial.printf("failed (rc=%d), retry in 5s\n", mqtt.state());
             delay(5000);
         }
     }
@@ -68,49 +72,39 @@ void mqtt_reconnect() {
 // ── Setup ─────────────────────────────────────────────────────
 void setup() {
     Serial.begin(115200);
-    Wire.begin();  // D1 Mini: SDA=D2(GPIO4), SCL=D1(GPIO5)
+    delay(200);
+    Serial.println("\n[Vaayu Bathroom Node] Booting with DHT11...");
 
-    if (!sht41.begin()) {
-        Serial.println("SHT41 not found!");
-        // Flash LED to indicate error — keep looping
-        while (true) { delay(1000); }
-    }
-    sht41.setPrecision(SHT4X_HIGH_PRECISION);
-    sht41.setHeater(SHT4X_NO_HEATER);
-    Serial.println("SHT41 OK");
-
+    dht.begin();
     wifi_connect();
+
     mqtt.setServer(MQTT_BROKER, MQTT_PORT);
-    mqtt_reconnect();
 }
 
 // ── Loop ──────────────────────────────────────────────────────
 void loop() {
-    if (WiFi.status() != WL_CONNECTED) wifi_connect();
     if (!mqtt.connected()) mqtt_reconnect();
     mqtt.loop();
 
     unsigned long now = millis();
-    if (now - lastPubMs >= PUB_INTERVAL) {
+    if (now - lastPubMs >= PUB_INTERVAL || lastPubMs == 0) {
         lastPubMs = now;
 
-        sensors_event_t hum_ev, temp_ev;
-        if (!sht41.getEvent(&hum_ev, &temp_ev)) {
-            Serial.println("SHT41 read failed");
+        float h = dht.readHumidity();
+        float t = dht.readTemperature();
+
+        if (isnan(h) || isnan(t)) {
+            Serial.println("[dht11] Failed to read from DHT11 sensor!");
             return;
         }
 
-        float temp = temp_ev.temperature;
-        float humid = hum_ev.relative_humidity;
+        Serial.printf("[dht11] Bathroom Temp: %.1f°C  Humidity: %.1f%%\n", t, h);
 
-        char buf[12];
-
-        dtostrf(temp, 0, 1, buf);
+        char buf[16];
+        snprintf(buf, sizeof(buf), "%.1f", t);
         mqtt.publish(TOPIC_TEMP, buf, true);
 
-        dtostrf(humid, 0, 1, buf);
+        snprintf(buf, sizeof(buf), "%.1f", h);
         mqtt.publish(TOPIC_HUMID, buf, true);
-
-        Serial.printf("Published: temp=%.1f°C  humidity=%.1f%%\n", temp, humid);
     }
 }

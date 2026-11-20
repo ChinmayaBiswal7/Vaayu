@@ -4,46 +4,44 @@
 //  Edit this file to adjust behaviour without touching logic.
 // ============================================================
 
-// ── Pin assignments ─────────────────────────────────────────
+// ── Pin assignments (ESP32 DevKit V1 / WROOM-32) ─────────────
 
-// I2C (shared bus: OLED + SHT41)
-#define PIN_I2C_SDA        8    // SDA line
-#define PIN_I2C_SCL        9    // SCL line
+// I2C (shared bus: 0.96" SSD1306 OLED + AHT20 sensor)
+#define PIN_I2C_SDA        21   // Standard ESP32 I2C SDA
+#define PIN_I2C_SCL        22   // Standard ESP32 I2C SCL
+#define AHT20_ADDR         0x38 // Default AHT20 I2C address
+#define OLED_ADDR          0x3C // Default SSD1306 I2C address
 
-// SHT41 I2C address (default 0x44)
-#define SHT41_ADDR         0x44
-
-// LD2410C radar — UART2
-#define PIN_RADAR_TX       17   // ESP32 TX → radar RX
-#define PIN_RADAR_RX       18   // ESP32 RX ← radar TX
+// HLK-LD2410C mmWave radar — UART2 (Serial2)
+#define PIN_RADAR_RX       16   // ESP32 RX2 (GPIO16) ← radar TX
+#define PIN_RADAR_TX       17   // ESP32 TX2 (GPIO17) → radar RX
 #define RADAR_BAUD         256000
 
-// DS18B20 (AC outlet temp probe) — 1-Wire
-#define PIN_DS18B20        10
+// DS18B20 (AC outlet temp probe) — 1-Wire (with 4.7 kΩ pull-up to 3.3V)
+#define PIN_DS18B20        4
 
-// PWM — room fan (via L298N IN1/IN2, enable on PWM pin)
-#define PIN_FAN_PWM        11   // L298N ENA
-#define PIN_FAN_IN1        12   // L298N IN1 (direction — keep HIGH)
-#define PIN_FAN_IN2        13   // L298N IN2 (keep LOW for forward)
+// PWM — L9110S Motor Driver: 5V Room Fan (Channel A)
+#define PIN_FAN_IA         25   // L9110S A-IA (PWM speed control)
+#define PIN_FAN_IB         26   // L9110S A-IB (direction / LOW)
 #define FAN_PWM_CHANNEL    0
-#define FAN_PWM_FREQ       25000  // 25 kHz — above hearing range
-#define FAN_PWM_BITS       8      // 0-255 duty
+#define FAN_PWM_FREQ       5000 // 5 kHz PWM for 5V DC fan
+#define FAN_PWM_BITS       8    // 0-255 duty
 
-// PWM — exhaust fan (via L298N second channel)
-#define PIN_EXHAUST_PWM    14   // L298N ENB
-#define PIN_EXHAUST_IN3    15
-#define PIN_EXHAUST_IN4    16
+// PWM — L9110S Motor Driver: 5V Exhaust Fan (Channel B)
+#define PIN_EXHAUST_IA     27   // L9110S B-IA (PWM speed control / ON-OFF)
+#define PIN_EXHAUST_IB     14   // L9110S B-IB (direction / LOW)
 #define EXHAUST_PWM_CH     1
-#define EXHAUST_PWM_FREQ   25000
+#define EXHAUST_PWM_FREQ   5000
 #define EXHAUST_PWM_BITS   8
 
-// IR transmitter LED (via NPN transistor)
-#define PIN_IR_SEND        4
-// IR receiver module (TSOP or similar)
-#define PIN_IR_RECV        5
+// 940 nm IR transmitter LED (via BC547 NPN transistor)
+#define PIN_IR_SEND        18
 
-// Buzzer (active, 3.3 V tolerant)
-#define PIN_BUZZER         6
+// VS1838B IR receiver module
+#define PIN_IR_RECV        19
+
+// Buzzer (active 5V buzzer)
+#define PIN_BUZZER         23
 
 // ── Temperature thresholds ───────────────────────────────────
 
