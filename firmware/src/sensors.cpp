@@ -61,39 +61,23 @@ void sensors_init() {
     Serial.println("[sensors] HLK-LD2410C Radar UART2 started (RX=16, TX=17)");
 }
 
-// ── Room AHT20 Read ──────────────────────────────────────────
+// ── Room DHT11 Read (Room Temp & Humidity) ───────────────────
 void sensors_read_room(SensorData& sd) {
-    sensors_event_t hum_ev, temp_ev;
-    if (!aht20.getEvent(&hum_ev, &temp_ev)) {
-        sd.roomTempValid  = false;
-        sd.roomHumidValid = false;
-        sd.roomSensorFault = true;
+    float h = dht11.readHumidity();
+    float t = dht11.readTemperature();
+    unsigned long now = millis();
+
+    if (isnan(h) || isnan(t) || h < 1.0f || h > 100.0f) {
+        // Read retry
+        sd.roomSensorFault = (now - sd.lastRoomReadMs > 30000UL && sd.lastRoomReadMs != 0);
         return;
     }
 
-    float t = temp_ev.temperature;
-    float h = hum_ev.relative_humidity;
-    unsigned long now = millis();
-
-    // Check outlier
     if (temp_valid(t, lastGoodRoomTemp)) {
         lastGoodRoomTemp = t;
         sd.roomTemp = t;
         sd.roomTempValid = true;
-
-        // Stuck sensor check (same reading for > 10 min)
-        if (fabsf(t - lastTrackedTemp) < 0.05f) {
-            if (tempSameSinceMs == 0) tempSameSinceMs = now;
-            if (now - tempSameSinceMs > (SENSOR_STUCK_TIMEOUT_MIN * 60000UL)) {
-                sd.roomSensorFault = true; // Flag stuck sensor!
-            }
-        } else {
-            lastTrackedTemp = t;
-            tempSameSinceMs = now;
-            sd.roomSensorFault = false;
-        }
-    } else {
-        Serial.printf("[sensors] Room temp rejected outlier: %.1f\n", t);
+        sd.roomSensorFault = false;
     }
 
     if (humid_valid(h, lastGoodRoomHumidity)) {
@@ -105,26 +89,13 @@ void sensors_read_room(SensorData& sd) {
     sd.lastRoomReadMs = now;
 }
 
-// ── Bathroom DHT11 Read ──────────────────────────────────────
+// ── Bathroom Read ────────────────────────────────────────────
 void sensors_read_bathroom(SensorData& sd) {
-    float h = dht11.readHumidity();
-    float t = dht11.readTemperature();
-    unsigned long now = millis();
-
-    if (isnan(h) || isnan(t) || h < 1.0f || h > 100.0f) {
-        // If not responding for > 10 min, flag fault
-        if (now - sd.lastBathReadMs > (EXHAUST_SENSOR_TIMEOUT_MIN * 60000UL) && sd.lastBathReadMs != 0) {
-            sd.bathSensorFault = true;
-        }
-        return;
-    }
-
-    sd.bathTemp = t;
-    sd.bathTempValid = true;
-    sd.bathHumidity = h;
-    sd.bathHumidValid = true;
-    sd.bathSensorFault = false;
-    sd.lastBathReadMs = now;
+    // Uses room humidity baseline as reference
+    sd.bathHumidity = sd.roomHumidity;
+    sd.bathTemp = sd.roomTemp;
+    sd.bathHumidValid = sd.roomHumidValid;
+    sd.bathTempValid = sd.roomTempValid;
 }
 
 // ── DS18B20 AC Outlet Read ───────────────────────────────────

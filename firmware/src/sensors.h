@@ -11,25 +11,25 @@
 
 // ── SensorData ───────────────────────────────────────────────
 struct SensorData {
-    // Room AHT20 sensor
+    // Room DHT11 sensor (GPIO 4)
     float roomTemp          = 25.0f;   // °C
     float roomHumidity      = 50.0f;   // %RH
     bool  roomTempValid     = false;
     bool  roomHumidValid    = false;
     bool  roomSensorFault   = false;
 
-    // Bathroom DHT11 sensor (wired to hub on GPIO 4)
+    // Bathroom / Virtual Humidity
     float bathTemp          = 25.0f;
     float bathHumidity      = 50.0f;
-    bool  bathTempValid     = false;
-    bool  bathHumidValid    = false;
+    bool  bathTempValid     = true;
+    bool  bathHumidValid    = true;
     bool  bathSensorFault   = false;
 
     // DS18B20 at AC air outlet (GPIO 27)
     float acOutletTemp      = 25.0f;
     bool  acOutletValid     = false;
 
-    // HLK-LD2410C radar (GPIO 16 / 17)
+    // HLK-LD2410 radar (GPIO 16 / 17)
     bool  presenceDetected  = false;
     uint16_t targetDistanceCm = 150;
     bool  radarValid        = false;
